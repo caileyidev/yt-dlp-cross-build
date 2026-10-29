@@ -1,0 +1,179 @@
+name: macOS release binaries (single-file)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }} binary
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            arch: x86_64
+            target_arch: x86_64
+          - os: macos-14
+            arch: arm64
+            target_arch: arm64
+
+    runs-on: ${{ matrix.os }}
+    env:
+      APP_NAME: yt-dlp
+      BUNDLE_ID: io.github.caileyidev.yt-dlp
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: ${{ matrix.arch == 'arm64' && 'arm64' || 'x64' }}
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -U .[default]
+          python -m pip install pyinstaller==6.22.0 delocate>=0.13.0
+
+      - name: Prepare asset directories
+        shell: bash
+        run: |
+          mkdir -p assets build dist
+          if [ -f assets/yt-dlp.icns ]; then
+            echo "Custom icon found: assets/yt-dlp.icns"
+          else
+            echo "No custom icon found at assets/yt-dlp.icns; icon will be skipped."
+          fi
+
+      - name: Create PyInstaller entry
+        shell: bash
+        run: |
+          cat > build/pyinstaller_entry.py <<'PY'
+          from yt_dlp import main
+
+          if __name__ == '__main__':
+              main()
+          PY
+
+      - name: Build single-file macOS binary
+        shell: bash
+        run: |
+          BIN_NAME="yt-dlp-macos-${{ matrix.arch }}"
+          ICON_ARG=""
+          if [ -f assets/yt-dlp.icns ]; then
+            ICON_ARG="--icon assets/yt-dlp.icns"
+          fi
+
+          pyinstaller --noconfirm --clean --onefile \
+            --strip \
+            --target-arch "${{ matrix.target_arch }}" \
+            --name "$BIN_NAME" \
+            --osx-bundle-identifier "${BUNDLE_ID}" \
+            $ICON_ARG \
+            --workpath build/pyinstaller_work \
+            --specpath build \
+            --distpath dist \
+            --collect-all yt_dlp \
+            build/pyinstaller_entry.py
+
+          chmod +x "dist/$BIN_NAME"
+          ls -lh "dist/$BIN_NAME"
+          file "dist/$BIN_NAME"
+
+      - name: Ad hoc sign the binary
+        shell: bash
+        run: |
+          BIN="dist/yt-dlp-macos-${{ matrix.arch }}"
+          codesign --force --deep --options runtime --sign - "$BIN"
+          codesign -dv --verbose=4 "$BIN"
+
+      - name: Package zip and generate SHA256
+        shell: bash
+        run: |
+          BIN="dist/yt-dlp-macos-${{ matrix.arch }}"
+          ZIP="dist/yt-dlp-macos-${{ matrix.arch }}.zip"
+          zip -9 -r "$ZIP" "$BIN"
+          shasum -a 256 "$ZIP" > "$ZIP.sha256"
+
+          echo "Generated files:"
+          ls -lh dist
+          echo "Checksum:"
+          cat "$ZIP.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yt-dlp-macos-${{ matrix.arch }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+
+  release:
+    name: Publish macOS release assets
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Generate combined checksum file
+        shell: bash
+        run: |
+          find release-assets -type f -name '*.sha256' -print -exec cat {} \; > release-assets/sha256sums.txt
+          echo "Artifacts:"
+          find release-assets -maxdepth 3 -type f -print | sort
+
+      - name: Generate release body
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME:-${{ github.event.release.tag_name || 'nightly' }}"
+          cat > release-body.md <<EOF
+          ## macOS single-file builds
+
+          Version: ${VERSION}
+          Build time: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          This workflow generates standalone macOS binaries for:
+          - x86_64
+          - arm64
+
+          Notes:
+          - Build is created with PyInstaller using a single-file executable.
+          - This binary is ad hoc signed only.
+          - For public distribution outside a trusted developer environment, Apple Developer ID + notarization is still required.
+          - macOS Gatekeeper may block unsigned/unauthorized binaries.
+
+          ### SHA256 checksums
+          ```text
+          $(cat release-assets/sha256sums.txt)
+          ```
+          EOF
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/**/*.zip
+            release-assets/**/*.sha256
+            release-assets/sha256sums.txt
+          body_path: release-body.md
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          fail_on_unmatched_files: true
